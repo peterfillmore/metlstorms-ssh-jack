@@ -1,0 +1,83 @@
+#! /usr/bin/python
+# Metlstorm's Antiforensic Loader Python Bootstrapper
+#
+# Given a python script file and some command line args, spits appropriate 
+# stuff to stdout which when executed in a shell on a machine with python
+# causes it to be run.
+#
+# The idea is to run it such that it's output goes to your remote shell
+# somewhere, eg with Screen's ! command, ie, 
+# ctrl-a :!!!!mafl-load script arg arg arg
+#
+# Not clever enough to do remote include management yet. Working on that.
+# For now you can supply multiple files on the command line, in the order
+# that they should be wedge into the resulting encoding. Not glamourous
+# but basically usable. 
+#
+# This is part of a larger antiforensic toolkit which is still under
+# development.
+#
+# Flames to metlstorm@storm.net.nz
+#
+# I'm aware that python bytecode isn't the most portable thing to ship around
+# It probably makes more sense to ship the source code over and compile
+# in the target environment. Feel free to do so if it's bust in your use.
+#
+
+import sys
+import zlib
+import base64
+import marshal
+import os
+
+STAGE1="stage1.py"
+
+def usage():
+	print "Usage: %s [[include.py]...] file.py arguments" % (sys.argv[0])
+	print " the first argument which isn't a file that exists is considered the start of arguments"
+
+def bootstrap(files, args = []):
+	"""Bootstraps a remote python interpreter"""
+	buf = ""
+	f = open(STAGE1, "r")
+	code = f.read()
+	f.close()
+	buf += "python -c '%s'\n" % code
+
+	code = ""
+	for fn in files:
+		f = open(fn, "r")
+		code += f.read()
+		f.close()
+	
+
+	buf += "import sys\nsys.argv=[sys.argv[0]] + %s\nimport zlib\nimport base64\nimport marshal\nd=base64.decodestring\nc=''\n" % args
+	codetransit = base64.encodestring(zlib.compress(marshal.dumps(compile(code, "<woot>", "exec"))))
+
+	for l in codetransit.split("\n"):
+		buf +="c+=d('%s')\n" % l 
+	
+	buf+="exec marshal.loads(zlib.decompress(c))\nsys.exit(0)\n"
+
+	return buf
+
+if len(sys.argv) < 2:
+	usage()
+	sys.exit(1)
+
+files = []
+args = []
+for i in range(1,len(sys.argv)):
+	if os.path.exists(sys.argv[i]):
+		files.append(sys.argv[i])
+	else:
+		break
+
+if len(sys.argv) > i:
+	args = sys.argv[i:]
+
+b=bootstrap(files, args)
+for line in b.split("\n"):
+	print line
+	sys.stdin.readline()
+

